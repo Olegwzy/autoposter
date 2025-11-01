@@ -1,0 +1,800 @@
+#!/usr/bin/env python3
+import os
+import time
+import threading
+import schedule
+import subprocess
+import requests
+import openai
+from datetime import datetime
+import pytz
+import socket
+from dotenv import load_dotenv
+import telegram
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
+
+# === Загрузка .env ===
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN_POSTER")
+CHAT_ID = os.getenv("CHAT_ID", "1359259211")  # можно вынести в .env при желании
+
+openai.api_key = OPENAI_API_KEY
+
+# === Часовой пояс Украины ===
+TZ = pytz.timezone("Europe/Kiev")
+
+# === Рабочее время ===
+START_HOUR = 1
+END_HOUR = 23
+
+# === Автопостер настройки ===
+autoposting_enabled = True
+require_confirmation = True
+current_topic = "мотивация"
+pending_posts = {}
+post_interval = 60  # минут
+
+TOPICS = {
+    "мотивация": "Напиши вдохновляющий пост для Telegram.",
+    "финансы": "Создай короткий пост с советом по личным финансам.",
+    "новости": "Создай информативный пост с последними мировыми новостями.",
+    "украина": "Создай пост о новостях Украины.",
+    "it": "Создай короткий пост о технологиях или искусственном интеллекте."
+}
+
+LOG_DIR = "/home/Deltacom/autoposter"
+VM_API = "http://127.0.0.1:5000/api/vm"
+ALLOWED_SERVICES = {"autoposter.service", "vm_api.service", "thinclient.service"}
+
+# === Утилиты ===
+def check_internet(host="8.8.8.8", port=53, timeout=3):
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
+        return True
+    except Exception:
+        return False
+
+def tail_file(path, lines=20):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            data = f.readlines()[-lines:]
+        text = "".join(data)
+        # Ограничим размер под Telegram (4096 символов)
+        return text[-3500:] if len(text) > 3500 else text
+    except Exception as e:
+        return f"⚠️ Не удалось прочитать {path}: {e}"
+
+def systemctl(cmd_list):
+    try:
+        out = subprocess.check_output(["systemctl"] + cmd_list, stderr=subprocess.STDOUT).decode("utf-8")
+        return 0, out
+    except subprocess.CalledProcessError as e:
+        return e.returncode, e.output.decode("utf-8", errors="ignore")
+
+# === GPT ===
+def gpt_reply(prompt: str) -> str:
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return resp.choices[0].message["content"].strip()
+    except Exception as e:
+        return f"⚠️ Ошибка GPT: {e}"
+
+# === Генерация поста ===
+def generate_message():
+    prompt = TOPICS.get(current_topic, TOPICS["мотивация"])
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return resp.choices[0].message["content"]
+    except Exception as e:
+        print(f"[Ошибка GPT] {e}")
+        return None
+
+# === Проверка времени суток ===
+def within_active_hours():
+    now = datetime.now(TZ)
+    return START_HOUR <= now.hour < END_HOUR
+
+# === Автопостинг ===
+def job():
+    if not autoposting_enabled or not within_active_hours():
+        return
+
+    message = generate_message()
+    if not message:
+        return
+
+    if not require_confirmation:
+        bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"📝 Пост опубликован автоматически (режим без подтверждения):\n\n{message}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        print("✅ Пост опубликован без подтверждения.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Опубликовать", callback_data="approve")],
+        [InlineKeyboardButton("❌ Отменить", callback_data="reject")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    msg = bot.send_message(
+        chat_id=CHAT_ID,
+        text=f"📝 Предложенный пост по теме *{current_topic}*:\n\n{message}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+    pending_posts[msg.message_id] = message
+    threading.Timer(600, lambda: auto_post(msg.message_id)).start()
+
+def auto_post(message_id):
+    if message_id not in pending_posts:
+        return
+    text = pending_posts.pop(message_id)
+    bot.send_message(chat_id=CHAT_ID, text=f"⏰ Время вышло — пост опубликован автоматически!\n\n{text}")
+
+# === Команды автопостера ===
+def start(update, context):
+    global autoposting_enabled
+    autoposting_enabled = True
+    update.message.reply_text("✅ Autoposter запущен!")
+
+def stop(update, context):
+    global autoposting_enabled
+    autoposting_enabled = False
+    update.message.reply_text("⛔ Autoposter остановлен!")
+
+def status(update, context):
+    status_text = "🟢 Работает" if autoposting_enabled else "🔴 Остановлен"
+    confirm_text = "🔔 подтверждение ВКЛЮЧЕНО" if require_confirmation else "⚙️ подтверждение ВЫКЛЮЧЕНО"
+    update.message.reply_text(
+        f"📊 Статус: {status_text}\n"
+        f"{confirm_text}\n"
+        f"Тема: {current_topic}\n"
+        f"Интервал: {post_interval} мин\n"
+        f"Активное время: {START_HOUR:02d}:00–{END_HOUR:02d}:00"
+    )
+
+def mode(update, context):
+    global current_topic
+    if not context.args:
+        update.message.reply_text("Темы: мотивация, финансы, новости, украина, it.\nПример: /mode финансы")
+        return
+    topic = context.args[0].lower()
+    if topic in TOPICS:
+        current_topic = topic
+        update.message.reply_text(f"✅ Тема изменена на: {topic}")
+    else:
+        update.message.reply_text("❌ Неизвестная тема.")
+
+def interval(update, context):
+    global post_interval
+    if not context.args:
+        update.message.reply_text("Пример: /interval 30 (в минутах)")
+        return
+    try:
+        minutes = int(context.args[0])
+        post_interval = minutes
+        schedule.clear()
+        schedule.every(post_interval).minutes.do(job)
+        update.message.reply_text(f"✅ Интервал изменён: каждые {minutes} минут.")
+    except ValueError:
+        update.message.reply_text("❌ Укажите число, например /interval 60")
+
+def test(update, context):
+    message = generate_message()
+    if not message:
+        update.message.reply_text("⚠️ Ошибка генерации поста.")
+        return
+
+    if not require_confirmation:
+        bot.send_message(chat_id=CHAT_ID, text=f"🧪 Тестовый пост:\n\n{message}", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Опубликовать", callback_data="approve")],
+        [InlineKeyboardButton("❌ Отменить", callback_data="reject")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    msg = update.message.reply_text(
+        f"🧪 *Тестовый пост по теме* _{current_topic}_:\n\n{message}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+    pending_posts[msg.message_id] = message
+
+def confirm_cmd(update, context):
+    global require_confirmation
+    if not context.args:
+        state = "включено ✅" if require_confirmation else "выключено ❌"
+        update.message.reply_text(f"Текущее состояние подтверждения: {state}\nИспользуй /confirm on или /confirm off.")
+        return
+    arg = context.args[0].lower()
+    if arg == "off":
+        require_confirmation = False
+        update.message.reply_text("⚙️ Подтверждение постов выключено.")
+    elif arg == "on":
+        require_confirmation = True
+        update.message.reply_text("🔔 Подтверждение постов включено.")
+    else:
+        update.message.reply_text("❌ Используй /confirm on или /confirm off.")
+
+def balance(update, context):
+    update.message.reply_text("💳 Баланс OpenAI недоступен официально через старый API. Будет добавлено позже.")
+
+# === Доп. кнопки ===
+def button(update, context):
+    query = update.callback_query
+    message_id = query.message.message_id
+    if message_id not in pending_posts:
+        query.answer("⏳ Этот пост уже обработан.")
+        return
+    if query.data == "approve":
+        text = pending_posts.pop(message_id)
+        bot.send_message(chat_id=CHAT_ID, text=f"✅ Публикую пост:\n\n{text}")
+        query.edit_message_text("✅ Пост опубликован!")
+    elif query.data == "reject":
+        pending_posts.pop(message_id, None)
+        bot.send_message(chat_id=CHAT_ID, text="🚫 Пост отклонён пользователем.")
+        query.edit_message_text("❌ Пост отменён.")
+
+# === Команды ThinClient v2 (диалог и управление) ===
+def ask(update, context):
+    if not context.args:
+        update.message.reply_text("Использование: /ask вопрос к GPT")
+        return
+    prompt = " ".join(context.args)
+    update.message.reply_text("🧠 Думаю…")
+    answer = gpt_reply(prompt)
+    update.message.reply_text(answer[:4000])
+
+def health(update, context):
+    # статусы systemd
+    lines = []
+    for svc in ["autoposter.service", "vm_api.service", "thinclient.service"]:
+        code, out = systemctl(["is-active", svc])
+        state = out.strip()
+        emoji = "🟢" if state == "active" and code == 0 else "🔴"
+        lines.append(f"{emoji} {svc} — {state}")
+    # uptime через VM API
+    try:
+        r = requests.get(f"{VM_API}/uptime", timeout=5)
+        if r.status_code == 200:
+            up = r.json().get("output", "").strip()
+            lines.append(f"✅ VM API: {up}")
+        else:
+            lines.append(f"⚠️ VM API HTTP {r.status_code}")
+    except Exception as e:
+        lines.append(f"❌ VM API недоступен: {e}")
+    update.message.reply_text("📊 Healthcheck:\n" + "\n".join(lines))
+
+def restart_service(update, context):
+    if not context.args:
+        update.message.reply_text("Использование: /restart autoposter|vm_api|thinclient")
+        return
+    name = context.args[0].strip().lower()
+    svc_map = {
+        "autoposter": "autoposter.service",
+        "vm_api": "vm_api.service",
+        "thinclient": "thinclient.service",
+    }
+    svc = svc_map.get(name)
+    if not svc:
+        update.message.reply_text("❌ Неизвестный сервис. Доступно: autoposter, vm_api, thinclient")
+        return
+    code, out = systemctl(["restart", svc])
+    if code == 0:
+        update.message.reply_text(f"⚙️ Перезапустил {svc} ✅")
+    else:
+        update.message.reply_text(f"❌ Ошибка перезапуска {svc}:\n{out[:1500]}")
+
+def reboot_confirm(update, context):
+    keyboard = [[
+        InlineKeyboardButton("🔄 Подтвердить перезагрузку", callback_data="reboot_yes"),
+        InlineKeyboardButton("Отмена", callback_data="reboot_no"),
+    ]]
+    update.message.reply_text("⚠️ Перезагрузить всю VM?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+def reboot_button(update, context):
+    query = update.callback_query
+    if query.data == "reboot_yes":
+        query.edit_message_text("🔄 Перезагружаю VM…")
+        try:
+            subprocess.Popen(["sudo", "reboot"])
+        except Exception as e:
+            bot.send_message(chat_id=CHAT_ID, text=f"❌ Ошибка reboot: {e}")
+    else:
+        query.edit_message_text("Операция отменена.")
+
+def logs(update, context):
+    # Покажем последние 20 строк логов thinclient + autoposter
+    tlog = tail_file(os.path.join(LOG_DIR, "thinclient.log"), 20)
+    alog = tail_file(os.path.join(LOG_DIR, "autoposter.log"), 20)
+    txt = "📄 *Последние строки thinclient.log:*\n```\n" + tlog + "\n```\n"
+    txt += "📄 *Последние строки autoposter.log:*\n```\n" + alog + "\n```"
+    update.message.reply_text(txt[:4000], parse_mode=ParseMode.MARKDOWN)
+
+def help_command(update, context):
+    help_text = (
+        "<b>📘 Команды управления:</b>\n\n"
+        "• /start — запустить автопостинг\n"
+        "• /stop — остановить автопостинг\n"
+        "• /status — статус и настройки автопостера\n"
+        "• /mode <тема> — сменить тему постов\n"
+        "• /interval <минуты> — задать интервал\n"
+        "• /test — тестовый пост\n"
+        "• /confirm on|off — подтверждение\n"
+        "• /ask <вопрос> — спросить GPT\n"
+        "• /health — сводка сервисов и аптайм\n"
+        "• /restart <autoposter|vm_api|thinclient> — рестарт сервиса\n"
+        "• /reboot — перезагрузка VM (с подтверждением)\n"
+        "• /logs — последние строки логов\n"
+        "• /help — показать это меню помощи\n"
+    )
+    update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+
+# === Telegram Bot ===
+def run_bot():
+    global bot
+    bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+    updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    # Автопостер
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("stop", stop))
+    dp.add_handler(CommandHandler("status", status))
+    dp.add_handler(CommandHandler("mode", mode))
+    dp.add_handler(CommandHandler("interval", interval))
+    dp.add_handler(CommandHandler("test", test))
+    dp.add_handler(CommandHandler("confirm", confirm_cmd))
+    dp.add_handler(CommandHandler("balance", balance))
+
+    # ThinClient v2
+    dp.add_handler(CommandHandler("ask", ask))
+    dp.add_handler(CommandHandler("health", health))
+    dp.add_handler(CommandHandler("restart", restart_service))
+    dp.add_handler(CommandHandler("reboot", reboot_confirm))
+    dp.add_handler(CommandHandler("logs", logs))
+    dp.add_handler(CommandHandler("help", help_command))
+
+    dp.add_handler(CallbackQueryHandler(button, pattern="^(approve|reject)$"))
+    dp.add_handler(CallbackQueryHandler(reboot_button, pattern="^reboot_(yes|no)$"))
+
+    updater.start_polling()
+    print("🤖 Бот запущен и ждёт команды...")
+    updater.idle()
+
+def scheduler_thread():
+    schedule.every(post_interval).minutes.do(job)
+    while True:
+        schedule.run_pending()
+        time.sleep(10)
+
+if __name__ == "__main__":
+    internet_ok = check_internet()
+    internet_status = "✅ Интернет доступен" if internet_ok else "⚠️ Интернет недоступен"
+    threading.Thread(target=scheduler_thread, daemon=True).start()
+    now_kyiv = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
+    startup_text = (
+        f"🤖 *Autoposter/Assistant запущен!* 🟢\n"
+        f"{internet_status}\n"
+        f"📅 {now_kyiv} (по Киеву)\n"
+        f"🕒 Активное время: {START_HOUR:02d}:00–{END_HOUR:02d}:00\n"
+        f"⏱ Интервал: каждые {post_interval} минут\n"
+        f"🎯 Текущая тема: {current_topic}\n"
+        f"👨‍💻 Работа: Oleg\n"
+        "Команды: /help"
+    )
+    bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+    bot.send_message(chat_id=CHAT_ID, text=startup_text, parse_mode=ParseMode.MARKDOWN)
+    run_bot()
+#!/usr/bin/env python3
+import os
+import time
+import threading
+import schedule
+import subprocess
+import requests
+import openai
+from datetime import datetime
+import pytz
+import socket
+from dotenv import load_dotenv
+import telegram
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
+
+# === Загрузка .env ===
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN_POSTER")
+CHAT_ID = os.getenv("CHAT_ID", "1359259211")  # можно вынести в .env при желании
+
+openai.api_key = OPENAI_API_KEY
+
+# === Часовой пояс Украины ===
+TZ = pytz.timezone("Europe/Kiev")
+
+# === Рабочее время ===
+START_HOUR = 1
+END_HOUR = 23
+
+# === Автопостер настройки ===
+autoposting_enabled = True
+require_confirmation = True
+current_topic = "мотивация"
+pending_posts = {}
+post_interval = 60  # минут
+
+TOPICS = {
+    "мотивация": "Напиши вдохновляющий пост для Telegram.",
+    "финансы": "Создай короткий пост с советом по личным финансам.",
+    "новости": "Создай информативный пост с последними мировыми новостями.",
+    "украина": "Создай пост о новостях Украины.",
+    "it": "Создай короткий пост о технологиях или искусственном интеллекте."
+}
+
+LOG_DIR = "/home/Deltacom/autoposter"
+VM_API = "http://127.0.0.1:5000/api/vm"
+ALLOWED_SERVICES = {"autoposter.service", "vm_api.service", "thinclient.service"}
+
+# === Утилиты ===
+def check_internet(host="8.8.8.8", port=53, timeout=3):
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
+        return True
+    except Exception:
+        return False
+
+def tail_file(path, lines=20):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            data = f.readlines()[-lines:]
+        text = "".join(data)
+        # Ограничим размер под Telegram (4096 символов)
+        return text[-3500:] if len(text) > 3500 else text
+    except Exception as e:
+        return f"⚠️ Не удалось прочитать {path}: {e}"
+
+def systemctl(cmd_list):
+    try:
+        out = subprocess.check_output(["systemctl"] + cmd_list, stderr=subprocess.STDOUT).decode("utf-8")
+        return 0, out
+    except subprocess.CalledProcessError as e:
+        return e.returncode, e.output.decode("utf-8", errors="ignore")
+
+# === GPT ===
+def gpt_reply(prompt: str) -> str:
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return resp.choices[0].message["content"].strip()
+    except Exception as e:
+        return f"⚠️ Ошибка GPT: {e}"
+
+# === Генерация поста ===
+def generate_message():
+    prompt = TOPICS.get(current_topic, TOPICS["мотивация"])
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return resp.choices[0].message["content"]
+    except Exception as e:
+        print(f"[Ошибка GPT] {e}")
+        return None
+
+# === Проверка времени суток ===
+def within_active_hours():
+    now = datetime.now(TZ)
+    return START_HOUR <= now.hour < END_HOUR
+
+# === Автопостинг ===
+def job():
+    if not autoposting_enabled or not within_active_hours():
+        return
+
+    message = generate_message()
+    if not message:
+        return
+
+    if not require_confirmation:
+        bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"📝 Пост опубликован автоматически (режим без подтверждения):\n\n{message}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        print("✅ Пост опубликован без подтверждения.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Опубликовать", callback_data="approve")],
+        [InlineKeyboardButton("❌ Отменить", callback_data="reject")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    msg = bot.send_message(
+        chat_id=CHAT_ID,
+        text=f"📝 Предложенный пост по теме *{current_topic}*:\n\n{message}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+    pending_posts[msg.message_id] = message
+    threading.Timer(600, lambda: auto_post(msg.message_id)).start()
+
+def auto_post(message_id):
+    if message_id not in pending_posts:
+        return
+    text = pending_posts.pop(message_id)
+    bot.send_message(chat_id=CHAT_ID, text=f"⏰ Время вышло — пост опубликован автоматически!\n\n{text}")
+
+# === Команды автопостера ===
+def start(update, context):
+    global autoposting_enabled
+    autoposting_enabled = True
+    update.message.reply_text("✅ Autoposter запущен!")
+
+def stop(update, context):
+    global autoposting_enabled
+    autoposting_enabled = False
+    update.message.reply_text("⛔ Autoposter остановлен!")
+
+def status(update, context):
+    status_text = "🟢 Работает" if autoposting_enabled else "🔴 Остановлен"
+    confirm_text = "🔔 подтверждение ВКЛЮЧЕНО" if require_confirmation else "⚙️ подтверждение ВЫКЛЮЧЕНО"
+    update.message.reply_text(
+        f"📊 Статус: {status_text}\n"
+        f"{confirm_text}\n"
+        f"Тема: {current_topic}\n"
+        f"Интервал: {post_interval} мин\n"
+        f"Активное время: {START_HOUR:02d}:00–{END_HOUR:02d}:00"
+    )
+
+def mode(update, context):
+    global current_topic
+    if not context.args:
+        update.message.reply_text("Темы: мотивация, финансы, новости, украина, it.\nПример: /mode финансы")
+        return
+    topic = context.args[0].lower()
+    if topic in TOPICS:
+        current_topic = topic
+        update.message.reply_text(f"✅ Тема изменена на: {topic}")
+    else:
+        update.message.reply_text("❌ Неизвестная тема.")
+
+def interval(update, context):
+    global post_interval
+    if not context.args:
+        update.message.reply_text("Пример: /interval 30 (в минутах)")
+        return
+    try:
+        minutes = int(context.args[0])
+        post_interval = minutes
+        schedule.clear()
+        schedule.every(post_interval).minutes.do(job)
+        update.message.reply_text(f"✅ Интервал изменён: каждые {minutes} минут.")
+    except ValueError:
+        update.message.reply_text("❌ Укажите число, например /interval 60")
+
+def test(update, context):
+    message = generate_message()
+    if not message:
+        update.message.reply_text("⚠️ Ошибка генерации поста.")
+        return
+
+    if not require_confirmation:
+        bot.send_message(chat_id=CHAT_ID, text=f"🧪 Тестовый пост:\n\n{message}", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Опубликовать", callback_data="approve")],
+        [InlineKeyboardButton("❌ Отменить", callback_data="reject")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    msg = update.message.reply_text(
+        f"🧪 *Тестовый пост по теме* _{current_topic}_:\n\n{message}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+    pending_posts[msg.message_id] = message
+
+def confirm_cmd(update, context):
+    global require_confirmation
+    if not context.args:
+        state = "включено ✅" if require_confirmation else "выключено ❌"
+        update.message.reply_text(f"Текущее состояние подтверждения: {state}\nИспользуй /confirm on или /confirm off.")
+        return
+    arg = context.args[0].lower()
+    if arg == "off":
+        require_confirmation = False
+        update.message.reply_text("⚙️ Подтверждение постов выключено.")
+    elif arg == "on":
+        require_confirmation = True
+        update.message.reply_text("🔔 Подтверждение постов включено.")
+    else:
+        update.message.reply_text("❌ Используй /confirm on или /confirm off.")
+
+def balance(update, context):
+    update.message.reply_text("💳 Баланс OpenAI недоступен официально через старый API. Будет добавлено позже.")
+
+# === Доп. кнопки ===
+def button(update, context):
+    query = update.callback_query
+    message_id = query.message.message_id
+    if message_id not in pending_posts:
+        query.answer("⏳ Этот пост уже обработан.")
+        return
+    if query.data == "approve":
+        text = pending_posts.pop(message_id)
+        bot.send_message(chat_id=CHAT_ID, text=f"✅ Публикую пост:\n\n{text}")
+        query.edit_message_text("✅ Пост опубликован!")
+    elif query.data == "reject":
+        pending_posts.pop(message_id, None)
+        bot.send_message(chat_id=CHAT_ID, text="🚫 Пост отклонён пользователем.")
+        query.edit_message_text("❌ Пост отменён.")
+
+# === Команды ThinClient v2 (диалог и управление) ===
+def ask(update, context):
+    if not context.args:
+        update.message.reply_text("Использование: /ask вопрос к GPT")
+        return
+    prompt = " ".join(context.args)
+    update.message.reply_text("🧠 Думаю…")
+    answer = gpt_reply(prompt)
+    update.message.reply_text(answer[:4000])
+
+def health(update, context):
+    # статусы systemd
+    lines = []
+    for svc in ["autoposter.service", "vm_api.service", "thinclient.service"]:
+        code, out = systemctl(["is-active", svc])
+        state = out.strip()
+        emoji = "🟢" if state == "active" and code == 0 else "🔴"
+        lines.append(f"{emoji} {svc} — {state}")
+    # uptime через VM API
+    try:
+        r = requests.get(f"{VM_API}/uptime", timeout=5)
+        if r.status_code == 200:
+            up = r.json().get("output", "").strip()
+            lines.append(f"✅ VM API: {up}")
+        else:
+            lines.append(f"⚠️ VM API HTTP {r.status_code}")
+    except Exception as e:
+        lines.append(f"❌ VM API недоступен: {e}")
+    update.message.reply_text("📊 Healthcheck:\n" + "\n".join(lines))
+
+def restart_service(update, context):
+    if not context.args:
+        update.message.reply_text("Использование: /restart autoposter|vm_api|thinclient")
+        return
+    name = context.args[0].strip().lower()
+    svc_map = {
+        "autoposter": "autoposter.service",
+        "vm_api": "vm_api.service",
+        "thinclient": "thinclient.service",
+    }
+    svc = svc_map.get(name)
+    if not svc:
+        update.message.reply_text("❌ Неизвестный сервис. Доступно: autoposter, vm_api, thinclient")
+        return
+    code, out = systemctl(["restart", svc])
+    if code == 0:
+        update.message.reply_text(f"⚙️ Перезапустил {svc} ✅")
+    else:
+        update.message.reply_text(f"❌ Ошибка перезапуска {svc}:\n{out[:1500]}")
+
+def reboot_confirm(update, context):
+    keyboard = [[
+        InlineKeyboardButton("🔄 Подтвердить перезагрузку", callback_data="reboot_yes"),
+        InlineKeyboardButton("Отмена", callback_data="reboot_no"),
+    ]]
+    update.message.reply_text("⚠️ Перезагрузить всю VM?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+def reboot_button(update, context):
+    query = update.callback_query
+    if query.data == "reboot_yes":
+        query.edit_message_text("🔄 Перезагружаю VM…")
+        try:
+            subprocess.Popen(["sudo", "reboot"])
+        except Exception as e:
+            bot.send_message(chat_id=CHAT_ID, text=f"❌ Ошибка reboot: {e}")
+    else:
+        query.edit_message_text("Операция отменена.")
+
+def logs(update, context):
+    # Покажем последние 20 строк логов thinclient + autoposter
+    tlog = tail_file(os.path.join(LOG_DIR, "thinclient.log"), 20)
+    alog = tail_file(os.path.join(LOG_DIR, "autoposter.log"), 20)
+    txt = "📄 *Последние строки thinclient.log:*\n```\n" + tlog + "\n```\n"
+    txt += "📄 *Последние строки autoposter.log:*\n```\n" + alog + "\n```"
+    update.message.reply_text(txt[:4000], parse_mode=ParseMode.MARKDOWN)
+
+def help_command(update, context):
+    help_text = (
+        "<b>📘 Команды управления:</b>\n\n"
+        "• /start — запустить автопостинг\n"
+        "• /stop — остановить автопостинг\n"
+        "• /status — статус и настройки автопостера\n"
+        "• /mode <тема> — сменить тему постов\n"
+        "• /interval <минуты> — задать интервал\n"
+        "• /test — тестовый пост\n"
+        "• /confirm on|off — подтверждение\n"
+        "• /ask <вопрос> — спросить GPT\n"
+        "• /health — сводка сервисов и аптайм\n"
+        "• /restart <autoposter|vm_api|thinclient> — рестарт сервиса\n"
+        "• /reboot — перезагрузка VM (с подтверждением)\n"
+        "• /logs — последние строки логов\n"
+        "• /help — показать это меню помощи\n"
+    )
+    update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+
+# === Telegram Bot ===
+def run_bot():
+    global bot
+    bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+    updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    # Автопостер
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("stop", stop))
+    dp.add_handler(CommandHandler("status", status))
+    dp.add_handler(CommandHandler("mode", mode))
+    dp.add_handler(CommandHandler("interval", interval))
+    dp.add_handler(CommandHandler("test", test))
+    dp.add_handler(CommandHandler("confirm", confirm_cmd))
+    dp.add_handler(CommandHandler("balance", balance))
+
+    # ThinClient v2
+    dp.add_handler(CommandHandler("ask", ask))
+    dp.add_handler(CommandHandler("health", health))
+    dp.add_handler(CommandHandler("restart", restart_service))
+    dp.add_handler(CommandHandler("reboot", reboot_confirm))
+    dp.add_handler(CommandHandler("logs", logs))
+    dp.add_handler(CommandHandler("help", help_command))
+
+    dp.add_handler(CallbackQueryHandler(button, pattern="^(approve|reject)$"))
+    dp.add_handler(CallbackQueryHandler(reboot_button, pattern="^reboot_(yes|no)$"))
+
+    updater.start_polling()
+    print("🤖 Бот запущен и ждёт команды...")
+    updater.idle()
+
+def scheduler_thread():
+    schedule.every(post_interval).minutes.do(job)
+    while True:
+        schedule.run_pending()
+        time.sleep(10)
+
+if __name__ == "__main__":
+    internet_ok = check_internet()
+    internet_status = "✅ Интернет доступен" if internet_ok else "⚠️ Интернет недоступен"
+    threading.Thread(target=scheduler_thread, daemon=True).start()
+    now_kyiv = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
+    startup_text = (
+        f"🤖 *Autoposter/Assistant запущен!* 🟢\n"
+        f"{internet_status}\n"
+        f"📅 {now_kyiv} (по Киеву)\n"
+        f"🕒 Активное время: {START_HOUR:02d}:00–{END_HOUR:02d}:00\n"
+        f"⏱ Интервал: каждые {post_interval} минут\n"
+        f"🎯 Текущая тема: {current_topic}\n"
+        f"👨‍💻 Работа: Oleg\n"
+        "Команды: /help"
+    )
+    bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+    bot.send_message(chat_id=CHAT_ID, text=startup_text, parse_mode=ParseMode.MARKDOWN)
+    run_bot()

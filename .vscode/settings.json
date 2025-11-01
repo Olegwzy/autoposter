@@ -1,0 +1,8 @@
+{
+    "python.defaultInterpreterPath": "/home/Deltacom/autoposter/venv/bin/python",
+    "python.analysis.extraPaths": [
+        "/home/Deltacom/autoposter/venv/lib/python3.11/site-packages"
+    ],
+    "python.analysis.autoImportCompletions": true,
+    "python.analysis.useLibraryCodeForTypes": true
+}
