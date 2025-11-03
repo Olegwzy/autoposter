@@ -1,12 +1,16 @@
-.env
-venv/
-__pycache__/
-.env
-venv/
-__pycache__/
-.env
-venv/
-__pycache__/
+# === Environment & Config ===
 .env
 *.log
+
+# === Python Virtual Environment ===
 venv/
+__pycache__/
+
+# === VS Code Settings ===
+.vscode/
+
+# === Backups & Temporary Files ===
+backups/
+*.tar.gz
+test.txt
+Test/
