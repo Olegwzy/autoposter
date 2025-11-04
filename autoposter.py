@@ -25,324 +25,46 @@ from typing import Optional, Tuple
 import requests
 import psutil
 
+import os
+import json
+import requests
+
 from telegram.ext import CallbackQueryHandler
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, CallbackContext
 from telegram.ext import MessageHandler, Filters
+from vm_daily_report import main as vm_daily_main
 
-# =========================
-# Логирование
-# =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-log = logging.getLogger("autoposter")
-
-# =========================
-# Пути и сервис
-# =========================
-APP_DIR = os.path.expanduser("~/autoposter")
-IMG_DIR = os.path.join(APP_DIR, "images")
-CFG_PATH = os.path.join(APP_DIR, "config.json")
-ADS_PATH = os.path.join(APP_DIR, "ads.json")  # NEW
-SERVICE_NAME = "autoposter.service"
-
-# Монетизация: частота рекламы (примерно 1 из 10)
-AD_FREQUENCY = 10
-
-# =========================
-# Среда
-# =========================
-load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "8291273565:AAHkz3Txr-_j-gwtAoSbBgd2S7TGBcILFgU"
-CHAT_ID_ENV = os.getenv("TELEGRAM_CHAT_ID")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-
-# =========================
-# Конфиг по умолчанию
-# =========================
-DEFAULT_CFG = {
-    "autoposting": False,
-    "confirm": False,
-    "chatmode": True,
-    "topic": "мотивация",
-    "interval": 60,           # минуты
-    "start_time": "00:01",   # HH:MM
-    "end_time": "23:59"      # HH:MM
-}
-
-state = DEFAULT_CFG.copy()
-pending_posts = {}
-
-# === GPT fallback state ===
-GPT_FAIL_THRESHOLD = 3
-_gpt_fail_count = 0
-_gpt_offline = False
-
-# === JobQueue link ===
-autopost_job = None
-
-# =========================
-# Утилиты
-# =========================
-
-def ensure_dirs():
-    os.makedirs(APP_DIR, exist_ok=True)
-    os.makedirs(IMG_DIR, exist_ok=True)
-
-
-def ensure_ads_file():  # NEW
-    """Создаёт ads.json с демо-данными, если отсутствует."""
-    if os.path.isfile(ADS_PATH):
-        return
-    demo = [
-        {
-            "text": "📢 Поддержи проект Autoposter — небольшое пожертвование помогает развивать бота ❤️",
-            "button_text": "💰 Поддержать",
-            "button_url": "https://t.me/yourbot?start=donate"
-        },
-        {
-            "text": "🔥 Попробуй Binance P2P — обмен USDT без комиссии!",
-            "button_text": "👉 Перейти",
-            "button_url": "https://binance.com/ru/register?ref=EPN12345"
-        }
-    ]
-    try:
-        with open(ADS_PATH, "w", encoding="utf-8") as f:
-            json.dump(demo, f, ensure_ascii=False, indent=2)
-        log.info("Создан ads.json с демо-записями.")
-    except Exception as e:
-        log.warning(f"Не удалось создать ads.json: {e}")
-
-
-def load_config():
-    global state
-    ensure_dirs()
-    if os.path.isfile(CFG_PATH):
-        try:
-            with open(CFG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            merged = DEFAULT_CFG.copy()
-            merged.update({k: v for k, v in cfg.items() if k in DEFAULT_CFG})
-            state = merged
-        except Exception as e:
-            log.warning("Не удалось прочитать config.json: %s", e)
-            state = DEFAULT_CFG.copy()
-    else:
-        save_config()
-
-
-def save_config():
-    ensure_dirs()
-    try:
-        with open(CFG_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.warning("Не удалось сохранить config.json: %s", e)
-
-
-def in_active_window(now: Optional[datetime] = None) -> bool:
-    if now is None:
-        now = datetime.now()
-    try:
-        sh = datetime.strptime(state["start_time"], "%H:%M").time()
-        eh = datetime.strptime(state["end_time"], "%H:%M").time()
-    except Exception:
-        sh, eh = dtime(0, 1), dtime(23, 59)
-    cur = now.time()
-    if sh <= eh:
-        return sh <= cur <= eh
-    else:
-        return cur >= sh or cur <= eh
-
-
-def local_ip() -> str:
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "unknown"
-
-
-def external_ip(timeout=5) -> str:
-    try:
-        r = requests.get("https://api.ipify.org", timeout=timeout)
-        if r.ok:
-            return r.text.strip()
-    except Exception:
-        pass
-    return "unknown"
-
-
-def sys_health() -> Tuple[str, str]:
-    try:
-        disk = psutil.disk_usage("/")
-        mem = psutil.virtual_memory()
-        disk_str = f"{disk.percent:.1f}%"
-        mem_str = f"{int((mem.total - mem.available)/1024/1024)}/{int(mem.total/1024/1024)}Mi"
-        return disk_str, mem_str
-    except Exception as e:
-        log.warning("sys_health error: %s", e)
-        return "n/a", "n/a"
-
-
-def tail_logs(unit: str = SERVICE_NAME, lines: int = 20) -> str:
-    try:
-        cmd = ["journalctl", "-u", unit, "-n", str(lines), "--no-pager"]
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=5)
-        return "\n".join(out.strip().splitlines()[-lines:])
-    except Exception as e:
-        return f"Не удалось получить логи: {e}"
-
-
-def pick_local_image() -> Optional[str]:
-    ensure_dirs()
-    patterns = ["*.jpg", "*.jpeg", "*.png", "*.webp"]
-    files = []
-    for p in patterns:
-        files.extend(glob.glob(os.path.join(IMG_DIR, p)))
-    files = [p for p in files if os.path.isfile(p) and os.path.getsize(p) > 0]
-    return random.choice(files) if files else None
-
-# =========================
-# GPT генерация (с офлайн-фолбеком)
-# =========================
-
-def _weekday_ru(i: int) -> str:
-    return ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"][i]
-
-GPT_FAIL_THRESHOLD = 3
-_gpt_fail_count = 0
-_gpt_offline = False
-
-def _mark_gpt_fail(e_msg: str = ""):
-    global _gpt_fail_count, _gpt_offline
-    _gpt_fail_count += 1
-    if _gpt_fail_count >= GPT_FAIL_THRESHOLD:
-        _gpt_offline = True
-        log.warning("[OpenAI] квота/лимит — переключаемся в офлайн до перезапуска.")
-    else:
-        log.info(f"[OpenAI] временно недоступно ({_gpt_fail_count}/{GPT_FAIL_THRESHOLD}).")
-
-
-def _mark_gpt_ok():
-    global _gpt_fail_count, _gpt_offline
-    _gpt_fail_count = 0
-    _gpt_offline = False
-
-
-def _offline_samples(topic: str) -> list:
-    base = topic.strip() or "мотивация"
-    return [
-        f"{base.capitalize()}: каждый день — шанс стать лучше. Маленький шаг тоже шаг!",
-        f"{base.capitalize()}: начни с 5 минут — дальше легче.",
-        f"{base.capitalize()}: сконцентрируйся на одном простом действии и сделай его сейчас.",
-    ]
-
-
-def generate_text(topic: str) -> str:
-    if _gpt_offline or not OPENAI_KEY:
-        return random.choice(_offline_samples(topic))
-    try:
-        import openai
-        for key_var in ("OPENAI_API_KEY", "OPENAI_API_KEY_2", "OPENAI_API_KEY_3"):
-            api_key = os.getenv(key_var)
-            if not api_key:
-                continue
-            openai.api_key = api_key
-            try:
-                response = openai.ChatCompletion.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": f"Короткий пост (1–2 строки). Тема: {topic.strip() or 'мотивация'}."}],
-                    max_tokens=60,
-                    temperature=0.8
-                )
-                txt = response["choices"][0]["message"]["content"].strip()
-                if txt:
-                    _mark_gpt_ok()
-                    return txt[:1024]
-                raise RuntimeError("Empty OpenAI text")
-            except Exception as e:
-                es = str(e).lower()
-                if "rate" in es or "quota" in es or "insufficient_quota" in es:
-                    _mark_gpt_fail()
-                    continue
-                _mark_gpt_fail()
-                continue
-        return random.choice(_offline_samples(topic))
-    except Exception:
-        _mark_gpt_fail()
-        return random.choice(_offline_samples(topic))
-
-# =========================
-# Отправка
-# =========================
-
-def safe_send_photo(bot, chat_id: str, img_path: str, caption: str) -> None:
-    if not img_path or not os.path.isfile(img_path):
-        raise FileNotFoundError(f"Image path invalid: {img_path}")
-    if os.path.getsize(img_path) <= 0:
-        raise IOError("Image file is empty")
-    cap = (caption or "").strip()
-    if len(cap) > 1024:
-        cap = cap[:1021] + "…"
-    last_err = None
-    for attempt in range(1, 4):
-        try:
-            with open(img_path, "rb") as f:
-                bot.send_photo(chat_id=chat_id, photo=f, caption=cap)
-            return
-        except Exception as e:
-            last_err = e
-            log.warning("[send_photo] attempt %d/3: %s", attempt, e)
-            time.sleep(1.5 * attempt)
-    raise last_err if last_err else RuntimeError("send_photo failed")
-
-
-def send_preview_with_buttons(bot, chat_id: str, text: str, img_path: Optional[str] = None) -> int:
-    token = str(int(time.time() * 1000))
-    pending_posts[token] = {"text": text, "img": img_path, "chat_id": str(chat_id)}
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Отправить", callback_data=f"confirm:yes:{token}"), InlineKeyboardButton("❌ Отмена", callback_data=f"confirm:no:{token}")]])
-    if img_path:
-        with open(img_path, "rb") as f:
-            msg = bot.send_photo(chat_id, photo=f, caption=text, reply_markup=kb)
-# autoposter.py — v3.3.2 Monetized (auto ads)
-# Базируется на V3.3.1 Clean+ (твоя текущая baseline-версия), без сокращений.
-# Новое в 3.3.2:
-# 1) Монетизация через ads.json (создаётся автоматически при отсутствии)
-# 2) Случайная вставка рекламного поста ≈ 1 из 10 (AD_FREQUENCY)
-# 3) Рекламный пост отправляется сразу (без confirm), с inline-кнопкой
-# 4) Лог: "💰 Отправлен рекламный пост."
-
-import os
-import sys#!/usr/bin/env python3
-
-import json
-import time
-import glob
+# === MONETIZATION BLOCK ===
 import random
-import socket
-import logging
-import sqlite3
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-import subprocess
-from datetime import datetime, time as dtime
-from typing import Optional, Tuple
+PARTNER_LINKS = [
+    "https://epn.bz/ru?ref_type=epnbz&inviter=276bd&erid=2SDnjeuJG4w&creative_hash=t54q3gebg6gk9uuf9qb68w37ikbxc111",
+    "https://accounts.binance.com/register?ref=1011259426",
+    "https://clickdealer.net/signup?ref=olegvm"
+]
+
+
+def add_monetization(text):
+    """Добавляет случайную партнёрскую ссылку в пост"""
+    link = random.choice(PARTNER_LINKS)
+    return f"{text}\n\n🔗 Поддержи проект: {link}"
 
 import requests
-import psutil
+import random
+import os
 
-from telegram.ext import CallbackQueryHandler
-from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
-from telegram.ext import MessageHandler, Filters
+def get_pixabay_image(query: str) -> str:
+    """Возвращает URL случайного изображения по теме из Pixabay"""
+    key = os.getenv("PIXABAY_KEY")
+    url = f"https://pixabay.com/api/?key={key}&q={query}&image_type=photo&orientation=horizontal&per_page=50"
+    resp = requests.get(url)
+    data = resp.json()
+    if data.get("hits"):
+        image = random.choice(data["hits"])
+        return image["webformatURL"]
+    return None
 
 # =========================
 # Логирование
@@ -369,9 +91,11 @@ AD_FREQUENCY = 10
 # Среда
 # =========================
 load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "8291273565:AAHkz3Txr-_j-gwtAoSbBgd2S7TGBcILFgU"
-CHAT_ID_ENV = os.getenv("TELEGRAM_CHAT_ID")
+
+TOKEN = os.getenv("TELEGRAM_TOKEN_POSTER") or os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+
 
 # =========================
 # Конфиг по умолчанию
@@ -419,7 +143,7 @@ def ensure_ads_file():  # NEW
         {
             "text": "🔥 Попробуй Binance P2P — обмен USDT без комиссии!",
             "button_text": "👉 Перейти",
-            "button_url": "https://binance.com/ru/register?ref=EPN12345"
+            "button_url": "https://accounts.binance.com/register?ref=1011259426"
         }
     ]
     try:
@@ -455,10 +179,49 @@ def save_config():
     except Exception as e:
         log.warning("Не удалось сохранить config.json: %s", e)
 
+# === GitHub API ===
+GITHUB_OWNER = "Olegwzy"
+GITHUB_REPO  = "autoposter"
+GITHUB_API   = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents"
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+
+def github_list_root():
+    """Список файлов в корне репозитория через GitHub API."""
+    headers = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    r = requests.get(GITHUB_API, headers=headers, timeout=15)
+    if not r.ok:
+        raise RuntimeError(f"GitHub API error {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+def _cfg_get_repo_shas() -> dict:
+    """Достаём из config.json последнюю «память» SHA, чтобы отмечать, что изменилось."""
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg.get("_repo_shas", {})
+    except Exception:
+        return {}
+
+def _cfg_set_repo_shas(shas: dict) -> None:
+    """Сохраняем «память» SHA обратно в config.json."""
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    cfg["_repo_shas"] = shas
+    with open(CFG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+from datetime import datetime, time as dtime
+import pytz
 
 def in_active_window(now: Optional[datetime] = None) -> bool:
+    kyiv_tz = pytz.timezone("Europe/Kiev")
     if now is None:
-        now = datetime.now()
+        now = datetime.now(kyiv_tz)
     try:
         sh = datetime.strptime(state["start_time"], "%H:%M").time()
         eh = datetime.strptime(state["end_time"], "%H:%M").time()
@@ -618,14 +381,26 @@ def safe_send_photo(bot, chat_id: str, img_path: str, caption: str) -> None:
 
 
 def send_preview_with_buttons(bot, chat_id: str, text: str, img_path: Optional[str] = None) -> int:
+    # === MONETIZATION HOOK ===
+    if os.getenv("MONETIZATION", "True").lower() == "true":
+        text = add_monetization(text)
+
     token = str(int(time.time() * 1000))
     pending_posts[token] = {"text": text, "img": img_path, "chat_id": str(chat_id)}
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Отправить", callback_data=f"confirm:yes:{token}"), InlineKeyboardButton("❌ Отмена", callback_data=f"confirm:no:{token}")]])
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Отправить", callback_data=f"confirm:yes:{token}"),
+            InlineKeyboardButton("❌ Отмена", callback_data=f"confirm:no:{token}")
+        ]
+    ])
+
     if img_path:
         with open(img_path, "rb") as f:
             msg = bot.send_photo(chat_id, photo=f, caption=text, reply_markup=kb)
     else:
         msg = bot.send_message(chat_id, text, reply_markup=kb)
+
     return msg.message_id
 
 
@@ -683,9 +458,47 @@ HELP_TEXT = (
     "/reboot — перезагрузка VM\n"
 )
 
+def repo_command(update, context):
+    chat_id = update.effective_chat.id
+    try:
+        items = github_list_root()
+        last = _cfg_get_repo_shas()
+        seen = {}
+
+        # Покажем ключевые файлы первыми
+        priority = {"autoposter.py", "README.md", "vm_daily_report.py", "vm_api.py",
+                    "requirements.txt", "config.json", "posts.txt", "ads.json"}
+        # Сортируем: приоритетные вверх, затем по имени
+        items = sorted(items, key=lambda x: (x["name"] not in priority, x["name"].lower()))
+
+        lines = ["📂 <b>autoposter — содержимое репозитория</b>"]
+        for it in items:
+            if it.get("type") not in ("file", "dir"):
+                continue
+            name = it["name"]
+            sha  = it.get("sha", "")[:7]
+            mark = ""
+            if it["type"] == "file":
+                if name in last and last[name] != sha:
+                    mark = " 🆕"
+                elif name not in last:
+                    mark = " 🆕"
+                seen[name] = sha
+                size = it.get("size", 0)
+                lines.append(f"• {name} — <code>{sha}</code> ({size} B){mark}")
+            else:
+                lines.append(f"• {name}/")
+
+        # Сохраняем «память» увиденных SHA (только файлы)
+        if seen:
+            _cfg_set_repo_shas(seen)
+
+        context.bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        context.bot.send_message(chat_id, f"❌ Ошибка GitHub: {e}")
+
 def _weekday_ru(i: int) -> str:
     return ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"][i]
-
 
 def _status_time_block() -> str:
     now = datetime.now()
@@ -843,7 +656,7 @@ def cmd_reboot(update: Update, context: CallbackContext):
 
 def cmd_test(update: Update, context: CallbackContext):
     bot = context.bot
-    chat_id = str(update.effective_chat.id or CHAT_ID_ENV or "").strip()
+    chat_id = str(update.effective_chat.id or CHAT_ID or "").strip()
     if not chat_id:
         update.message.reply_text("⚠️ Chat_id пуст. Напиши боту сюда команду ещё раз, чтобы бот получил chat_id.")
         return
@@ -860,6 +673,15 @@ def cmd_test(update: Update, context: CallbackContext):
         update.message.reply_text("🧪 Тест выполнен.")
     except Exception as e:
         update.message.reply_text(f"⚠️ Ошибка отправки поста: {e}")
+
+def report_command(update, context):
+    """Выполнить ежедневный отчёт о состоянии VM."""
+    chat_id = update.effective_chat.id
+    try:
+        vm_daily_main()  # вызывает существующий отчёт
+        context.bot.send_message(chat_id, "✅ Отчёт отправлен администратору.")
+    except Exception as e:
+        context.bot.send_message(chat_id, f"⚠️ Ошибка при создании отчёта: {e}")
 
 # =========================
 # Монетизация — реклама
@@ -880,21 +702,25 @@ def pick_ad() -> Optional[dict]:  # NEW
         return None
 
 # =========================
-# Автопостинг
+# Автопостинг (обновлённый)
 # =========================
 last_post_ts = 0.0
 
 def autopost_tick(bot):
+    """Автоматическая публикация контента с изображением и монетизацией"""
     global last_post_ts
+
+    # --- Проверка включения автопостинга и расписания ---
     if not state["autoposting"]:
         return
     if not in_active_window():
         return
+
     now = time.time()
     if now - last_post_ts < state["interval"] * 60:
         return
 
-    chat_id = (CHAT_ID_ENV or "").strip()
+    chat_id = (CHAT_ID or "").strip()
     if not chat_id:
         log.info("CHAT_ID не задан — автоматический пост пропущен.")
         return
@@ -902,24 +728,37 @@ def autopost_tick(bot):
     # === Случайный рекламный пост (≈1 из AD_FREQUENCY) ===
     try:
         if random.randint(1, AD_FREQUENCY) == 1:
-            ad = pick_ad()
-            if ad:
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton(ad["button_text"], url=ad["button_url"])]] )
-                bot.send_message(chat_id, ad["text"], reply_markup=kb)
-                log.info("💰 Отправлен рекламный пост.")
-                last_post_ts = now  # реклама засчитывается как пост
-                return
+            # Генерация рекламного текста
+            theme = state.get("theme", "автоматизация")
+            text = f"🤖 Автоматизация — ключ к свободе времени.\n\n#{theme}"
+
+            # Добавляем партнёрскую ссылку (если включена)
+            if os.getenv("MONETIZATION", "True").lower() == "true":
+                text = add_monetization(text)
+
+            # Получаем изображение с Pixabay
+            img_url = get_pixabay_image(theme)
+
+            # Отправляем рекламный пост
+            if img_url:
+                bot.send_photo(chat_id=chat_id, photo=img_url, caption=text)
+                log.info(f"💰 Отправлен рекламный пост с фото ({theme}).")
+            else:
+                bot.send_message(chat_id, text, parse_mode="HTML")
+                log.info(f"💰 Отправлен рекламный пост без фото ({theme}).")
+
+            last_post_ts = now
+            return
     except Exception as e:
         log.warning(f"Рекламный пост не отправлен: {e}")
         # не прерываем — попробуем обычный контент
 
-    # === Обычный контент ===
-    text = generate_text(state["topic"])  # (фикс багa со слешем)
+    # === Обычный GPT-контент ===
+    text = generate_text(state["topic"])
     img  = pick_local_image()
     try:
         if state.get("confirm", False):
             send_preview_with_buttons(bot, chat_id, text, img)
-            # отметку времени ставим только при фактической публикации
         else:
             if img:
                 safe_send_photo(bot, chat_id, img, text)
@@ -1029,7 +868,6 @@ def balance_command(update, context):
     balance = get_user_balance(user_id)
     update.message.reply_text(f"💰 Ваш баланс: {balance} ⭐")
 
-# === 💎 Блок поддержки и донатов через Telegram Wallet ===
 
 # === 💎 Блок поддержки и донатов через Telegram Wallet ===
 
@@ -1147,8 +985,14 @@ def main():
     dp.add_handler(CommandHandler("restart", cmd_restart))
     dp.add_handler(CommandHandler("reboot", cmd_reboot))
     dp.add_handler(CommandHandler("test", cmd_test))
+
+    # 🔹 GitHub репозиторий (новая команда)
+    dp.add_handler(CommandHandler("repo", repo_command))
+    dp.add_handler(CommandHandler("report", report_command))
+
     # Донаты
     dp.add_handler(CommandHandler("donate", donate_command))
+
     dp.add_handler(CallbackQueryHandler(payment_confirm_callback, pattern="^paid_confirm$"))
     dp.add_handler(CallbackQueryHandler(lambda update, context: donate_command(update, context), pattern="^open_donate$"))
 

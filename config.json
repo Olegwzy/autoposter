@@ -3,7 +3,7 @@
   "confirm": false,
   "chatmode": true,
   "topic": "украина",
-  "interval": 180,
+  "interval": 1,
   "start_time": "00:00",
   "end_time": "23:59"
 }
