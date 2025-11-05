@@ -40,9 +40,9 @@ from vm_daily_report import main as vm_daily_main
 import random
 
 PARTNER_LINKS = [
-    "https://epn.bz/ru?ref_type=epnbz&inviter=276bd&erid=2SDnjeuJG4w&creative_hash=t54q3gebg6gk9uuf9qb68w37ikbxc111",
-    "https://accounts.binance.com/register?ref=1011259426",
-    "https://clickdealer.net/signup?ref=olegvm"
+    "http://bit.ly/4oMIsWN",
+    "https://bit.ly/3LeQN7s"
+    
 ]
 
 
@@ -1026,5 +1026,55 @@ def main():
             log.warning(f"🔁 Ошибка polling: {e}, повтор через 5 секунд...")
             time.sleep(5)
 
+# === Flask Web Admin ===
+from flask import Flask, jsonify
+import psutil
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "🟢 Autoposter Flask API is running. Try /status"
+
+@app.route("/status")
+def status():
+    mem = psutil.virtual_memory()
+    uptime = datetime.datetime.now() - datetime.datetime.fromtimestamp(psutil.boot_time())
+    data = {
+        "autoposter": "✅ активен",
+        "uptime": str(uptime).split('.')[0],
+        "memory_used": f"{mem.percent}%",
+        "interval": f"{INTERVAL_MINUTES} мин",
+        "theme": CURRENT_TOPIC,
+        "confirm": CONFIRMATION_MODE,
+        "status": "online"
+    }
+    return jsonify(data)
+
+
 if __name__ == "__main__":
-    main()
+    from threading import Thread
+    import logging
+
+    def run_flask():
+        print("🌐 Flask server starting on port 5000...")
+        try:
+            app.run(host="0.0.0.0", port=5000)
+        except Exception as e:
+            logging.error(f"Flask failed to start: {e}")
+
+    # 🔹 Запуск Flask в отдельном потоке (демон)
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # 🔹 Запуск основного Telegram-бота
+    try:
+        print("🤖 Starting Telegram Autoposter...")
+        main()  # ← это твоя основная функция (где запускается бот, scheduler и т.д.)
+    except KeyboardInterrupt:
+        print("🛑 Autoposter stopped manually.")
+    except Exception as e:
+        logging.error(f"Autoposter crashed: {e}")
+
+
+
