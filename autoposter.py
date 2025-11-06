@@ -1029,6 +1029,7 @@ def main():
 # === Flask Web Admin ===
 from flask import Flask, jsonify
 import psutil
+from datetime import datetime  # ← используем тот же datetime, что и выше
 
 app = Flask(__name__)
 
@@ -1039,7 +1040,7 @@ def home():
 @app.route("/status")
 def status():
     mem = psutil.virtual_memory()
-    uptime = datetime.datetime.now() - datetime.datetime.fromtimestamp(psutil.boot_time())
+    uptime = datetime.now() - datetime.fromtimestamp(psutil.boot_time())
     data = {
         "autoposter": "✅ активен",
         "uptime": str(uptime).split('.')[0],
@@ -1063,18 +1064,7 @@ if __name__ == "__main__":
         except Exception as e:
             logging.error(f"Flask failed to start: {e}")
 
-    # 🔹 Запуск Flask в отдельном потоке (демон)
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    Thread(target=run_flask, daemon=True).start()
 
-    # 🔹 Запуск основного Telegram-бота
-    try:
-        print("🤖 Starting Telegram Autoposter...")
-        main()  # ← это твоя основная функция (где запускается бот, scheduler и т.д.)
-    except KeyboardInterrupt:
-        print("🛑 Autoposter stopped manually.")
-    except Exception as e:
-        logging.error(f"Autoposter crashed: {e}")
-
-
-
+    # запускаем твой основной бот
+    main()
