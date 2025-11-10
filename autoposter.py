@@ -34,7 +34,13 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, CallbackContext
 from telegram.ext import MessageHandler, Filters
-from vm_daily_report import main as vm_daily_main
+# === Импорт отчёта VM (безопасный) ===
+try:
+    from vm_daily_report import main as vm_daily_main
+except ImportError:
+    def vm_daily_main():
+        pass
+
 
 # === MONETIZATION BLOCK ===
 import random
@@ -95,7 +101,7 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN_POSTER") or os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-
+ADMIN_ID = os.getenv("ADMIN_ID")
 
 # =========================
 # Конфиг по умолчанию
@@ -170,6 +176,16 @@ def load_config():
     else:
         save_config()
 
+def is_admin(update):
+    """Проверяет, является ли пользователь админом"""
+    try:
+        return str(update.effective_user.id) == str(ADMIN_ID)
+    except Exception:
+        return False
+
+def admin_only(update):
+    """Отвечает, если команда не от администратора"""
+    update.message.reply_text("⛔ У вас нет прав для этой команды.")
 
 def save_config():
     ensure_dirs()
@@ -215,7 +231,6 @@ def _cfg_set_repo_shas(shas: dict) -> None:
     with open(CFG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-from datetime import datetime, time as dtime
 import pytz
 
 def in_active_window(now: Optional[datetime] = None) -> bool:
@@ -527,6 +542,9 @@ def cmd_start(update: Update, context: CallbackContext):
         log.warning(f"Не удалось запланировать job при /start: {e}")
 
 def cmd_stop(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return admin_only(update)
+
     global autopost_job
     state["autoposting"] = False
     save_config()
@@ -539,11 +557,17 @@ def cmd_stop(update: Update, context: CallbackContext):
         log.warning(f"Не удалось остановить job: {e}")
     update.message.reply_text("⏸️ Автопостинг остановлен.")
 
+
 def cmd_status(update: Update, context: CallbackContext):
+    import pytz
+    tz = pytz.timezone("Europe/Kyiv")
+    now = datetime.now(tz)
+
     disk, mem = sys_health()
     gpt_line = "💭 GPT Mode: Online ✅" if not _gpt_offline and OPENAI_KEY else "💤 GPT Mode: Offline fallback"
+
     msg = (
-        "📊 Статус Autoposter\n\n"
+         "📊 Статус Autoposter\n\n"
         f"🟢 Активен: {state['autoposting']}\n"
         f"🔔 Подтверждение: {state['confirm']}\n"
         f"🎯 Тема: {state['topic']}\n"
@@ -555,6 +579,7 @@ def cmd_status(update: Update, context: CallbackContext):
         f"🌐 Local IP: {local_ip()}\n"
         f"🌍 External IP: {external_ip()}\n"
     )
+
     update.message.reply_text(msg)
 
 def cmd_mode(update: Update, context: CallbackContext):
@@ -630,14 +655,27 @@ def cmd_logs(update: Update, context: CallbackContext):
     update.message.reply_text(f"```\n{txt}\n```", parse_mode=None)
 
 def cmd_daily(update: Update, context: CallbackContext):
+    import pytz
+    tz = pytz.timezone("Europe/Kyiv")
+    now = datetime.now(tz)
+
+    header = now.strftime("🕓 %d.%m.%Y | %H:%M:%S (EET)")
+    weekday_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"][now.weekday()]
+    today_line = f"📅 Сегодня: {now.strftime('%d.%m.%Y')} ({weekday_ru})"
+
     disk, mem = sys_health()
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    autoposter_status = "active ✅" if state["autoposting"] else "stopped 💤"
+
     msg = (
-        f"🗓️ Ежедневный отчёт {now}\n"
+        f"{header}\n{today_line}\n\n"
+        "🗓️ Ежедневный отчёт о VM\n\n"
         f"💾 Disk: {disk} | 💡 Mem: {mem}\n"
-        f"🌐 Local IP: {local_ip()} | 🌍 External IP: {external_ip()}\n"
-        f"🔧 Services: autoposter — {'active' if state['autoposting'] else 'stopped'}\n"
+        f"🌐 Local IP: {local_ip()}\n"
+        f"🌍 External IP: {external_ip()}\n\n"
+        f"🤖 Autoposter: {autoposter_status}\n"
+        f"🧠 GPT Mode: {'Online ✅' if not _gpt_offline and OPENAI_KEY else 'Offline fallback 💭'}\n"
     )
+
     update.message.reply_text(msg)
 
 def cmd_restart(update: Update, context: CallbackContext):
@@ -767,6 +805,49 @@ def autopost_tick(bot):
             last_post_ts = now
     except Exception as e:
         log.warning("Автопостинг: ошибка отправки: %s", e)
+
+# =========================
+# DAILY IMAGE POST (утро и вечер)
+# =========================
+
+def daily_image_post(bot):
+    """Отправляет 'Доброе утро' или 'Спокойной ночи' с GPT-пожеланием"""
+    import pytz
+    tz = pytz.timezone("Europe/Kyiv")
+    now = datetime.now(tz)
+    hour = now.hour
+
+    # Определяем режим
+    if 9 <= hour < 11:
+        folder = os.path.join(IMG_DIR, "morning")
+        topic = "доброе утро"
+        emoji = "🌞"
+    elif 21 <= hour < 23:
+        folder = os.path.join(IMG_DIR, "night")
+        topic = "спокойной ночи"
+        emoji = "🌙"
+    else:
+        return  # вне нужных часов — пропуск
+
+    # Случайное изображение из нужной папки
+    patterns = ["*.jpg", "*.jpeg", "*.png", "*.webp"]
+    files = []
+    for p in patterns:
+        files.extend(glob.glob(os.path.join(folder, p)))
+    if not files:
+        log.warning(f"Нет картинок в {folder}")
+        return
+    img = random.choice(files)
+
+    # Генерация подписи
+    text = generate_text(topic)
+    caption = f"{emoji} {text}"
+
+    try:
+        safe_send_photo(bot, CHAT_ID, img, caption)
+        log.info(f"📸 Отправлено изображение ({topic}): {os.path.basename(img)}")
+    except Exception as e:
+        log.warning(f"daily_image_post error: {e}")
 
 # =========================
 # ChatMode: GPT диалог без /ask
@@ -1000,20 +1081,41 @@ def main():
     dp.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm:(yes|no):"))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, chatmode_handler))
 
-    # Проверяет работу OPENAI_API_KEY, OPENAI_API_KEY_2, OPENAI_API_KEY_3
+     # Проверяет работу OPENAI_API_KEY, OPENAI_API_KEY_2, OPENAI_API_KEY_3
     dp.add_handler(CommandHandler("keycheck", cmd_keycheck))
-    
+
+    # ✅ Подключение пользовательских команд (например, /getid)
+    try:
+        import custom_commands
+        custom_commands.register(dp)
+        log.info("✅ custom_commands подключен")
+    except Exception as e:
+        log.warning(f"Не удалось загрузить custom_commands: {e}")
+
     # Первый пост (best-effort)
     try:
         autopost_tick(updater.bot)
     except Exception as e:
         log.warning(f"Первый пост не удался: {e}")
 
-    # JobQueue
+
+        # JobQueue
     try:
         schedule_autopost_job(updater)
     except Exception as e:
         log.warning(f"Не удалось запустить автопостинг (job): {e}")
+
+    # === Планировщик ежедневных утренних и вечерних постов ===
+    try:
+        from datetime import time as dtime
+        import pytz
+        tz = pytz.timezone("Europe/Kyiv")
+        jq = updater.job_queue
+        jq.run_daily(lambda ctx: daily_image_post(updater.bot), time=dtime(9, 0, tzinfo=tz))
+        jq.run_daily(lambda ctx: daily_image_post(updater.bot), time=dtime(21, 0, tzinfo=tz))
+        log.info("🕘 Планировщик daily_image_post активирован (09:00 и 21:00)")
+    except Exception as e:
+        log.warning(f"Не удалось запустить daily_image_post: {e}")
 
     # Polling
     while True:
@@ -1026,45 +1128,5 @@ def main():
             log.warning(f"🔁 Ошибка polling: {e}, повтор через 5 секунд...")
             time.sleep(5)
 
-# === Flask Web Admin ===
-from flask import Flask, jsonify
-import psutil
-from datetime import datetime  # ← используем тот же datetime, что и выше
-
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "🟢 Autoposter Flask API is running. Try /status"
-
-@app.route("/status")
-def status():
-    mem = psutil.virtual_memory()
-    uptime = datetime.now() - datetime.fromtimestamp(psutil.boot_time())
-    data = {
-        "autoposter": "✅ активен",
-        "uptime": str(uptime).split('.')[0],
-        "memory_used": f"{mem.percent}%",
-        "interval": f"{INTERVAL_MINUTES} мин",
-        "theme": CURRENT_TOPIC,
-        "confirm": CONFIRMATION_MODE,
-        "status": "online"
-    }
-    return jsonify(data)
-
-
 if __name__ == "__main__":
-    from threading import Thread
-    import logging
-
-    def run_flask():
-        print("🌐 Flask server starting on port 5000...")
-        try:
-            app.run(host="0.0.0.0", port=5000)
-        except Exception as e:
-            logging.error(f"Flask failed to start: {e}")
-
-    Thread(target=run_flask, daemon=True).start()
-
-    # запускаем твой основной бот
     main()
